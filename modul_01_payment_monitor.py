@@ -22,6 +22,7 @@ import base64
 import logging
 import threading
 from datetime import datetime, timezone, date
+from decimal import Decimal
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse
 
@@ -42,7 +43,7 @@ RESOURCES = {
         "label": "💰 Thanh toán",
         "table": "payment_monitor_logs",
         "order": "CASE status WHEN 'OVERDUE' THEN 0 WHEN 'PENDING' THEN 1 ELSE 2 END, due_date",
-        "badge": "status",
+        "badge": "status", "countdown": "due_date",
         "cols": [
             {"k": "room_code", "l": "Phòng", "t": "text"},
             {"k": "tenant_name", "l": "Khách", "t": "text"},
@@ -57,7 +58,7 @@ RESOURCES = {
         "label": "📄 Hợp đồng",
         "table": "contract_alerts",
         "order": "expiry_date",
-        "badge": "alert_type",
+        "badge": "alert_type", "countdown": "expiry_date",
         "cols": [
             {"k": "contract_id", "l": "Mã HĐ", "t": "text"},
             {"k": "room_code", "l": "Phòng", "t": "text"},
@@ -71,7 +72,7 @@ RESOURCES = {
         "label": "📢 Marketing",
         "table": "marketing_conversations",
         "order": "id DESC",
-        "badge": "conversation_status",
+        "badge": "conversation_status", "countdown": None,
         "cols": [
             {"k": "conversation_id", "l": "Mã", "t": "text"},
             {"k": "platform", "l": "Kênh", "t": "select", "opts": ["ZALO", "MESSENGER", "FACEBOOK", "TELEGRAM"]},
@@ -82,6 +83,51 @@ RESOURCES = {
              "opts": ["ACTIVE", "CONVERTED", "ABANDONED"]},
         ],
         "actions": [],
+    },
+    "tenant": {
+        "label": "🏅 Chấm điểm",
+        "table": "tenant_scores",
+        "order": "overall_score DESC NULLS LAST, id DESC",
+        "badge": "recommendation", "countdown": None,
+        "cols": [
+            {"k": "tenant_name", "l": "Khách", "t": "text"},
+            {"k": "room_code", "l": "Phòng", "t": "text"},
+            {"k": "payment_score", "l": "Điểm TT", "t": "number"},
+            {"k": "behavior_score", "l": "Điểm HV", "t": "number"},
+            {"k": "risk_score", "l": "Điểm RR", "t": "number"},
+            {"k": "overall_score", "l": "Tổng", "t": "number"},
+            {"k": "recommendation", "l": "Đề xuất", "t": "select", "opts": ["GIU", "THEO_DOI", "CANH_BAO"]},
+        ],
+        "actions": ["run"],
+    },
+    "asset": {
+        "label": "📇 Giấy tờ",
+        "table": "asset_ocr_records",
+        "order": "id DESC",
+        "badge": "document_type", "countdown": None,
+        "cols": [
+            {"k": "tenant_id", "l": "Mã khách", "t": "text"},
+            {"k": "document_type", "l": "Loại GT", "t": "select", "opts": ["CCCD", "METER", "OTHER"]},
+            {"k": "confidence_score", "l": "Độ tin (%)", "t": "number"},
+            {"k": "verified", "l": "Đã xác minh", "t": "bool"},
+        ],
+        "actions": [],
+    },
+    "maintenance": {
+        "label": "🔧 Bảo trì",
+        "table": "maintenance_predictions",
+        "order": "CASE severity WHEN 'CRITICAL' THEN 0 WHEN 'HIGH' THEN 1 WHEN 'MEDIUM' THEN 2 ELSE 3 END, predicted_date NULLS LAST",
+        "badge": "severity", "countdown": "predicted_date",
+        "cols": [
+            {"k": "room_code", "l": "Phòng", "t": "text"},
+            {"k": "asset_type", "l": "Thiết bị", "t": "select", "opts": ["AC", "ELECTRICAL", "WATER", "OTHER"]},
+            {"k": "failure_probability", "l": "Xác suất hỏng (%)", "t": "number"},
+            {"k": "predicted_date", "l": "Dự kiến", "t": "date"},
+            {"k": "severity", "l": "Mức độ", "t": "select", "opts": ["LOW", "MEDIUM", "HIGH", "CRITICAL"]},
+            {"k": "recommended_action", "l": "Hành động", "t": "text"},
+            {"k": "maintenance_ticket_created", "l": "Đã tạo phiếu", "t": "bool"},
+        ],
+        "actions": ["run"],
     },
 }
 
@@ -167,6 +213,8 @@ def send_telegram(text):
 
 def _coerce(col, value):
     t = col["t"]
+    if t == "bool":
+        return value in (True, "true", "True", "1", 1, "Có", "co", "CO")
     if value is None or (isinstance(value, str) and value.strip() == ""):
         return None
     if t == "number":
@@ -190,18 +238,13 @@ def res_list(res_id):
                 v = r.get(c["k"])
                 if isinstance(v, (date, datetime)):
                     r[c["k"]] = v.isoformat()[:10]
-                elif hasattr(v, "__float__") and c.get("money"):
+                elif isinstance(v, Decimal):
                     r[c["k"]] = float(v)
-            # cột phụ: số ngày tới hạn cho hợp đồng
-            if res_id == "contract" and r.get("expiry_date"):
+            # cột phụ: số ngày tới hạn (theo cột 'countdown' của resource)
+            cd = cfg.get("countdown")
+            if cd and r.get(cd):
                 try:
-                    d = datetime.strptime(r["expiry_date"], "%Y-%m-%d").date()
-                    r["_days"] = (d - today).days
-                except Exception:  # noqa: BLE001
-                    r["_days"] = None
-            if res_id == "payment" and r.get("due_date"):
-                try:
-                    d = datetime.strptime(r["due_date"], "%Y-%m-%d").date()
+                    d = datetime.strptime(str(r[cd])[:10], "%Y-%m-%d").date()
                     r["_days"] = (d - today).days
                 except Exception:  # noqa: BLE001
                     r["_days"] = None
@@ -297,11 +340,56 @@ def run_contract():
         conn.close()
 
 
+def run_tenant():
+    """Tính điểm tổng = TB(payment, behavior, 100-risk) và đề xuất theo ngưỡng."""
+    conn = connect_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT id, COALESCE(payment_score,0), COALESCE(behavior_score,0), "
+                    "COALESCE(risk_score,0) FROM tenant_scores")
+        rows = cur.fetchall()
+        for rid, pay, beh, risk in rows:
+            overall = round((float(pay) + float(beh) + (100 - float(risk))) / 3, 1)
+            rec = "GIU" if overall >= 80 else ("THEO_DOI" if overall >= 60 else "CANH_BAO")
+            cur.execute("UPDATE tenant_scores SET overall_score=%s, recommendation=%s WHERE id=%s",
+                        (overall, rec, rid))
+        conn.commit()
+        return f"Chấm điểm {len(rows)} khách."
+    finally:
+        conn.close()
+
+
+def run_maintenance():
+    """Cảnh báo thiết bị mức HIGH/CRITICAL dự kiến hỏng trong 30 ngày."""
+    import psycopg2.extras
+    conn = connect_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT room_code, asset_type, severity, predicted_date, recommended_action "
+                    "FROM maintenance_predictions WHERE severity IN ('HIGH','CRITICAL')")
+        rows = cur.fetchall()
+        today = date.today()
+        soon = [r for r in rows if r["predicted_date"] and 0 <= (r["predicted_date"] - today).days <= 30]
+        if soon:
+            lines = ["🔧 <b>CẢNH BÁO BẢO TRÌ</b>"]
+            for r in soon:
+                lines.append(f"• {r['room_code']} — {r['asset_type']} [{r['severity']}] dự kiến {r['predicted_date']}"
+                             + (f" → {r['recommended_action']}" if r['recommended_action'] else ""))
+            send_telegram("\n".join(lines))
+        return f"{len(rows)} thiết bị nguy cơ cao · {len(soon)} cần xử lý trong 30 ngày."
+    finally:
+        conn.close()
+
+
 def run_action(res_id):
     if res_id == "payment":
         return run_payment()
     if res_id == "contract":
         return run_contract()
+    if res_id == "tenant":
+        return run_tenant()
+    if res_id == "maintenance":
+        return run_maintenance()
     return "Module này chưa có nghiệp vụ đối soát."
 
 
@@ -324,7 +412,8 @@ def run_all_scheduled():
 # =================================================================== HTTP
 def _client_config():
     """Config rút gọn gửi cho trình duyệt để dựng bảng/form động."""
-    return {rid: {"label": c["label"], "badge": c["badge"], "cols": c["cols"], "actions": c["actions"]}
+    return {rid: {"label": c["label"], "badge": c["badge"], "cols": c["cols"],
+                  "actions": c["actions"], "countdown": c.get("countdown")}
             for rid, c in RESOURCES.items()}
 
 
@@ -345,10 +434,10 @@ button{cursor:pointer;border:0;border-radius:8px;padding:8px 12px;font-size:13px
 table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
 th,td{padding:9px 11px;text-align:left;font-size:13px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase}
-.badge{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700}
-.OVERDUE,.TERMINATION,.ABANDONED{background:#7f1d1d;color:#fecaca}
-.PENDING,.WARNING,.ACTIVE{background:#78350f;color:#fde68a}
-.PAID,.CONVERTED,.RENEWAL{background:#064e3b;color:#a7f3d0}
+.badge{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;background:#334155;color:#cbd5e1}
+.OVERDUE,.TERMINATION,.ABANDONED,.CANH_BAO,.HIGH,.CRITICAL{background:#7f1d1d;color:#fecaca}
+.PENDING,.WARNING,.ACTIVE,.THEO_DOI,.MEDIUM{background:#78350f;color:#fde68a}
+.PAID,.CONVERTED,.RENEWAL,.GIU,.LOW{background:#064e3b;color:#a7f3d0}
 .money{font-variant-numeric:tabular-nums;font-weight:600}
 .tblwrap{overflow-x:auto}.muted{color:var(--muted)}
 dialog{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:18px;width:min(94vw,420px)}
@@ -381,13 +470,17 @@ async function init(){CFG=await api('/api/config');const tb=$('tabs');tb.innerHT
   init2();}
 function init2(){document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('on',Object.keys(CFG)[i]===CUR));
   $('runbtn').style.display=CFG[CUR].actions.includes('run')?'':'none';
-  const th=CFG[CUR].cols.map(c=>`<th>${c.l}</th>`).join('')+(CUR!=='marketing'?'<th>Ngày</th>':'')+'<th></th>';
+  const th=CFG[CUR].cols.map(c=>`<th>${c.l}</th>`).join('')+(CFG[CUR].countdown?'<th>Ngày</th>':'')+'<th></th>';
   $('thead').innerHTML='<tr>'+th+'</tr>';load();}
 async function load(){try{const d=await api('/api/'+CUR+'/list');DATA=d;const b=$('badge'in CFG?'':'');
   const rows=$('rows');rows.innerHTML='';
   d.forEach(p=>{
-    let tds=CFG[CUR].cols.map(c=>{let v=p[c.k];if(c.k===CFG[CUR].badge)return`<td><span class="badge ${v||''}">${v||''}</span></td>`;if(c.money)return`<td class="money">${vnd(v)}</td>`;return`<td>${v==null?'':v}</td>`;}).join('');
-    if(CUR!=='marketing'){let dd=p._days==null?'—':(p._days<0?('quá '+(-p._days)+'n'):('còn '+p._days+'n'));tds+=`<td>${dd}</td>`;}
+    let tds=CFG[CUR].cols.map(c=>{let v=p[c.k];
+      if(c.k===CFG[CUR].badge)return`<td><span class="badge ${v||''}">${v==null?'':v}</span></td>`;
+      if(c.t==='bool')return`<td>${v?'✅':'—'}</td>`;
+      if(c.money)return`<td class="money">${vnd(v)}</td>`;
+      return`<td>${v==null?'':v}</td>`;}).join('');
+    if(CFG[CUR].countdown){let dd=p._days==null?'—':(p._days<0?('quá '+(-p._days)+'n'):('còn '+p._days+'n'));tds+=`<td>${dd}</td>`;}
     const pay=(CUR==='payment'&&p.status!=='PAID')?`<button class="paid" onclick="markPaid(${p.id})">Đã thu</button> `:'';
     tds+=`<td style="white-space:nowrap">${pay}<button class="b2" onclick="edit(${p.id})">Sửa</button> <button class="del" onclick="del(${p.id})">Xóa</button></td>`;
     rows.insertAdjacentHTML('beforeend','<tr>'+tds+'</tr>');
@@ -396,6 +489,7 @@ async function load(){try{const d=await api('/api/'+CUR+'/list');DATA=d;const b=
 }catch(e){$('err').textContent='Lỗi tải: '+e.message;}}
 function buildForm(p){const f=$('form');f.innerHTML=CFG[CUR].cols.map(c=>{
   const val=p?(p[c.k]==null?'':p[c.k]):'';
+  if(c.t==='bool'){const yes=(p&&(p[c.k]===true||p[c.k]==='true'));return`<label>${c.l}</label><select id="f_${c.k}"><option value="Không" ${!yes?'selected':''}>Không</option><option value="Có" ${yes?'selected':''}>Có</option></select>`;}
   if(c.t==='select'){const o=c.opts.map(x=>`<option ${x===val?'selected':''}>${x}</option>`).join('');return`<label>${c.l}</label><select id="f_${c.k}">${o}</select>`;}
   const type=c.t==='number'?'number':(c.t==='date'?'date':'text');
   return`<label>${c.l}</label><input id="f_${c.k}" type="${type}" value="${String(val).replace(/"/g,'&quot;')}">`;
