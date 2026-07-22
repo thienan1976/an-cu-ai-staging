@@ -393,6 +393,47 @@ def run_action(res_id):
     return "Module này chưa có nghiệp vụ đối soát."
 
 
+# =============================================== OCR giấy tờ (FPT.AI Vision)
+def fpt_ocr_cccd(image_bytes):
+    """Gọi FPT.AI ID Recognition đọc CCCD/CMND. Trả dict thông tin trích xuất.
+    Cần env FPTAI_API_KEY. Đăng ký free tại https://fpt.ai."""
+    key = os.getenv("FPTAI_API_KEY", "").strip()
+    if _placeholder(key):
+        raise RuntimeError("Chưa cấu hình FPTAI_API_KEY trong Render → Environment.")
+    import requests
+    r = requests.post(
+        "https://api.fpt.ai/vision/idr/vnm",
+        headers={"api-key": key},
+        files={"image": ("cccd.jpg", image_bytes, "image/jpeg")},
+        timeout=30,
+    )
+    j = r.json()
+    if j.get("errorCode") not in (0, None):
+        raise RuntimeError(j.get("errorMessage") or f"FPT.AI lỗi (mã {j.get('errorCode')})")
+    rows = j.get("data") or []
+    if not rows:
+        raise RuntimeError("Không đọc được thông tin từ ảnh.")
+    return rows[0]
+
+
+def ocr_create_asset(image_bytes):
+    """Đọc CCCD -> lưu 1 bản ghi asset_ocr_records, trả dữ liệu trích xuất."""
+    import json as _json
+    data = fpt_ocr_cccd(image_bytes)
+    conn = connect_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO asset_ocr_records (tenant_id, document_type, extracted_data, verified) "
+            "VALUES (%s, 'CCCD', %s::jsonb, false)",
+            (data.get("id"), _json.dumps(data, ensure_ascii=False)),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return data
+
+
 def run_all_scheduled():
     global _last_report
     ran = datetime.now(timezone.utc).isoformat()
@@ -450,6 +491,8 @@ label{font-size:12px;color:var(--muted)}.err{color:#f87171;font-size:13px;margin
 <div class="bar">
   <button class="b1" onclick="openForm()">＋ Thêm mới</button>
   <button class="b2" id="runbtn" onclick="runNow()" style="display:none">🔄 Chạy đối soát</button>
+  <button class="b2" id="ocrbtn" onclick="ocrPick()" style="display:none">📷 Quét CCCD (OCR)</button>
+  <input type="file" id="ocrfile" accept="image/*" style="display:none" onchange="ocrScan(this)">
   <button class="b2" onclick="load()">↻ Tải lại</button>
   <span class="muted" id="count"></span>
 </div>
@@ -470,6 +513,7 @@ async function init(){CFG=await api('/api/config');const tb=$('tabs');tb.innerHT
   init2();}
 function init2(){document.querySelectorAll('.tab').forEach((el,i)=>el.classList.toggle('on',Object.keys(CFG)[i]===CUR));
   $('runbtn').style.display=CFG[CUR].actions.includes('run')?'':'none';
+  $('ocrbtn').style.display=(CUR==='asset')?'':'none';
   const th=CFG[CUR].cols.map(c=>`<th>${c.l}</th>`).join('')+(CFG[CUR].countdown?'<th>Ngày</th>':'')+'<th></th>';
   $('thead').innerHTML='<tr>'+th+'</tr>';load();}
 async function load(){try{const d=await api('/api/'+CUR+'/list');DATA=d;const b=$('badge'in CFG?'':'');
@@ -502,6 +546,12 @@ async function del(id){const p=DATA.find(x=>x.id===id);if(!confirm('XÓA dòng #
   try{await api('/api/'+CUR+'/delete','POST',{id});load();}catch(e){alert('Lỗi: '+e.message);}}
 async function markPaid(id){if(!confirm('Đánh dấu ĐÃ THU?'))return;try{await api('/api/payment/save','POST',{id,status:'PAID'});load();}catch(e){alert('Lỗi: '+e.message);}}
 async function runNow(){try{const r=await api('/api/'+CUR+'/run','POST',{});alert('Xong: '+(r.detail||''));load();}catch(e){alert('Lỗi: '+e.message);}}
+function ocrPick(){$('ocrfile').click();}
+function ocrScan(inp){const f=inp.files[0];if(!f)return;const rd=new FileReader();
+  rd.onload=async()=>{try{const r=await api('/api/asset/ocr','POST',{image:rd.result});const d=r.data||{};
+    alert('✅ Đã đọc CCCD:\\n'+(d.name||'?')+' — '+(d.id||'?')+'\\n'+(d.dob||'')+'\\n'+(d.address||d.home||''));load();
+  }catch(e){alert('Lỗi OCR: '+e.message);}inp.value='';};
+  rd.readAsDataURL(f);}
 init();setInterval(load,60000);
 </script></body></html>"""
 
@@ -568,6 +618,14 @@ class _Handler(BaseHTTPRequestHandler):
         if not self._authed():
             self._need_auth(); return
         body = self._body()
+        if path == "/api/asset/ocr":
+            try:
+                img = base64.b64decode((body.get("image") or "").split(",")[-1])
+                data = ocr_create_asset(img)
+                self._send(200, json.dumps({"ok": True, "data": data}, ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
+            return
         m = re.match(r"^/api/(\w+)/(save|delete|run)$", path)
         if not m or m.group(1) not in RESOURCES:
             self._send(404, json.dumps({"error": "not found"})); return
