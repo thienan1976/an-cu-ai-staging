@@ -2,29 +2,37 @@
 # -*- coding: utf-8 -*-
 """
 Payment Monitor (modul_01_payment_monitor) — An Cư Hà Nội
-Đối soát thanh toán, phát hiện nợ quá hạn, cảnh báo Telegram.
+Đối soát thanh toán + TOOL QUẢN TRỊ WEB (dashboard có mật khẩu).
 
-Priority: CRITICAL · Phase 1
+Chạy 2 chế độ (tự nhận qua biến môi trường PORT):
+  - Web Service (Render đặt PORT): đối soát lúc khởi động + lặp mỗi CHECK_INTERVAL_HOURS,
+    đồng thời phục vụ trang quản trị web tại "/" (có đăng nhập).
+  - Cron Job / chạy tay (không PORT): đối soát 1 lần rồi thoát.
 
-Cách chạy (2 chế độ, tự nhận biết qua biến môi trường PORT):
-  - Web Service (Render đặt PORT): chạy đối soát 1 lần lúc khởi động,
-    mở cổng HTTP báo trạng thái, tự lặp lại mỗi CHECK_INTERVAL_HOURS giờ.
-  - Cron Job / chạy tay (không có PORT): đối soát 1 lần rồi thoát.
+Trang quản trị:
+  GET  /            → dashboard HTML (cần đăng nhập Basic Auth)
+  GET  /status      → JSON kỹ thuật (không cần đăng nhập, cho health check)
+  GET  /api/payments→ danh sách hóa đơn (JSON, cần đăng nhập)
+  POST /api/mark-paid {id}         → đánh dấu ĐÃ THU
+  POST /api/add {room_code,...}    → thêm hóa đơn
+  POST /api/run                    → chạy đối soát ngay
 
-Biến môi trường dùng đến:
-  DATABASE_URL            postgresql://... (bắt buộc để đối soát thật)
-  TELEGRAM_BOT_TOKEN      token bot (tùy chọn — không có thì bỏ qua cảnh báo)
-  TELEGRAM_ALERT_CHANNEL  hoặc TELEGRAM_HAVEN_ID — nơi nhận cảnh báo
-  PORT                    Render tự đặt cho Web Service
-  CHECK_INTERVAL_HOURS    chu kỳ lặp ở chế độ web (mặc định 6)
+Đăng nhập: user tùy ý, mật khẩu = ADMIN_PASSWORD (nếu đặt) hoặc DATABASE_PASSWORD.
+
+Biến môi trường:
+  DATABASE_URL / DATABASE_* , TELEGRAM_BOT_TOKEN, TELEGRAM_ALERT_CHANNEL,
+  PORT, CHECK_INTERVAL_HOURS (mặc định 6), ADMIN_PASSWORD (tùy chọn)
 """
 
 import os
+import re
 import json
+import base64
 import logging
 import threading
-from datetime import datetime, timezone
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from datetime import datetime, timezone, date
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 
 logging.basicConfig(
     level=logging.INFO,
@@ -33,17 +41,14 @@ logging.basicConfig(
 logger = logging.getLogger("payment_monitor")
 
 MODULE_ID = "modul_01_payment_monitor"
+SUPABASE_POOLER_REGION = os.getenv("SUPABASE_POOLER_REGION", "ap-northeast-2").strip()
 
-# Trạng thái đối soát gần nhất — dùng cho endpoint HTTP
-_last_report = {
-    "status": "starting",
-    "ran_at": None,
-    "detail": "Chưa chạy lần đối soát nào.",
-}
+_last_report = {"status": "starting", "ran_at": None, "detail": "Chưa chạy đối soát."}
+_run_lock = threading.Lock()
 
 
+# ------------------------------------------------------------------ tiện ích
 def _placeholder(value):
-    """Giá trị rỗng hoặc còn dạng [PASTE_...] coi như chưa cấu hình."""
     if not value:
         return True
     v = value.strip()
@@ -51,7 +56,6 @@ def _placeholder(value):
 
 
 def get_database_url():
-    """Lấy DATABASE_URL, hoặc dựng từ các phần rời nếu cần."""
     url = os.getenv("DATABASE_URL", "").strip()
     if url and not _placeholder(url):
         return url
@@ -65,25 +69,11 @@ def get_database_url():
     return f"postgresql://{user}:{pwd}@{host}:{port}/{name}"
 
 
-# Region của project trên Supabase (không phải bí mật — chỉ là vị trí máy chủ).
-# Dùng để tự chuyển host trực tiếp (chỉ IPv6, Render free không tới được)
-# sang Connection Pooler (IPv4) khi cần.
-SUPABASE_POOLER_REGION = os.getenv("SUPABASE_POOLER_REGION", "ap-northeast-2").strip()
-
-
 def get_connection_candidates():
-    """
-    Trả về danh sách URL kết nối để thử theo thứ tự.
-    Nếu host là dạng Supabase trực tiếp (db.<ref>.supabase.co, chỉ IPv6),
-    ưu tiên các URL pooler (IPv4) để chạy được trên Render, rồi mới tới URL gốc.
-    """
-    import re
-    from urllib.parse import urlparse
-
+    """Ưu tiên pooler (IPv4) nếu host là Supabase trực tiếp (chỉ IPv6)."""
     base = get_database_url()
     if not base:
         return []
-
     candidates = []
     try:
         p = urlparse(base)
@@ -93,194 +83,181 @@ def get_connection_candidates():
             ref = m.group(1)
             pwd = p.password or ""
             dbname = (p.path or "/postgres").lstrip("/") or "postgres"
-            region = SUPABASE_POOLER_REGION
             for node in ("aws-1", "aws-0"):
                 for port in (6543, 5432):
-                    ph = f"{node}-{region}.pooler.supabase.com"
-                    candidates.append(
-                        f"postgresql://postgres.{ref}:{pwd}@{ph}:{port}/{dbname}"
-                    )
+                    ph = f"{node}-{SUPABASE_POOLER_REGION}.pooler.supabase.com"
+                    candidates.append(f"postgresql://postgres.{ref}:{pwd}@{ph}:{port}/{dbname}")
     except Exception as e:  # noqa: BLE001
         logger.warning("Không phân tích được DATABASE_URL: %s", e)
-
-    candidates.append(base)  # host gốc để dự phòng (nơi có IPv6)
+    candidates.append(base)
     return candidates
 
 
 def connect_db():
-    """Thử lần lượt các URL ứng viên, trả về (conn, url) đầu tiên kết nối được."""
     import psycopg2
-
     last_err = None
     for url in get_connection_candidates():
         try:
             conn = psycopg2.connect(url, connect_timeout=15)
-            safe = url.split("@")[-1]  # ẩn user/mật khẩu khi log
-            logger.info("Kết nối DB thành công qua %s", safe)
-            return conn, url
+            logger.info("Kết nối DB qua %s", url.split("@")[-1])
+            return conn
         except Exception as e:  # noqa: BLE001
             last_err = e
             logger.warning("Không kết nối được (%s): %s", url.split("@")[-1], str(e).splitlines()[0])
     if last_err:
         raise last_err
-    raise RuntimeError("Không có URL kết nối nào khả dụng.")
+    raise RuntimeError("Không có URL kết nối khả dụng.")
+
+
+def admin_password():
+    p = os.getenv("ADMIN_PASSWORD", "").strip()
+    if p and not _placeholder(p):
+        return p
+    return os.getenv("DATABASE_PASSWORD", "").strip()
 
 
 def send_telegram_alert(text):
-    """Gửi cảnh báo qua Telegram nếu đã cấu hình. Không có thì bỏ qua êm."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
     chat_id = os.getenv("TELEGRAM_ALERT_CHANNEL", "") or os.getenv("TELEGRAM_HAVEN_ID", "")
     if _placeholder(token) or _placeholder(chat_id):
-        logger.info("Telegram chưa cấu hình — bỏ qua gửi cảnh báo.")
+        logger.info("Telegram chưa cấu hình — bỏ qua.")
         return False
     try:
         import requests
-
-        resp = requests.post(
+        r = requests.post(
             f"https://api.telegram.org/bot{token.strip()}/sendMessage",
             json={"chat_id": chat_id.strip(), "text": text, "parse_mode": "HTML"},
             timeout=15,
         )
-        if resp.status_code == 200:
-            logger.info("Đã gửi cảnh báo Telegram.")
-            return True
-        logger.warning("Telegram trả về mã %s: %s", resp.status_code, resp.text[:200])
-        return False
+        return r.status_code == 200
     except Exception as e:  # noqa: BLE001
-        logger.warning("Lỗi gửi Telegram: %s", e)
+        logger.warning("Lỗi Telegram: %s", e)
         return False
 
 
-def _log_to_db(cur, level, message, details=None):
+# ------------------------------------------------------------ thao tác DB
+def db_list_payments():
+    import psycopg2.extras
+    conn = connect_db()
     try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute(
-            "INSERT INTO module_logs (module_id, log_level, message, error_details) "
-            "VALUES (%s, %s, %s, %s)",
-            (MODULE_ID, level, message, json.dumps(details) if details else None),
+            "SELECT id, room_code, tenant_name, amount, due_date, payment_date, status, notes "
+            "FROM payment_monitor_logs "
+            "ORDER BY CASE status WHEN 'OVERDUE' THEN 0 WHEN 'PENDING' THEN 1 ELSE 2 END, due_date"
         )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Không ghi được module_logs: %s", e)
+        rows = cur.fetchall()
+        today = date.today()
+        out = []
+        for r in rows:
+            due = r["due_date"]
+            days = (due - today).days if due else None
+            out.append({
+                "id": r["id"], "room_code": r["room_code"], "tenant_name": r["tenant_name"],
+                "amount": float(r["amount"]) if r["amount"] is not None else None,
+                "due_date": due.isoformat() if due else None,
+                "payment_date": r["payment_date"].isoformat() if r["payment_date"] else None,
+                "status": r["status"], "notes": r["notes"], "days": days,
+            })
+        return out
+    finally:
+        conn.close()
 
 
-def _update_health(cur, status, notes, success, error):
+def db_mark_paid(inv_id):
+    conn = connect_db()
     try:
+        cur = conn.cursor()
         cur.execute(
-            "INSERT INTO module_health_status "
-            "(module_id, status, last_check, error_count, success_count, notes) "
-            "VALUES (%s, %s, %s, %s, %s, %s)",
-            (MODULE_ID, status, datetime.now(timezone.utc), error, success, notes),
+            "UPDATE payment_monitor_logs SET status='PAID', payment_date=CURRENT_DATE WHERE id=%s",
+            (int(inv_id),),
         )
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Không ghi được module_health_status: %s", e)
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
 
 
+def db_add_payment(room_code, tenant_name, amount, due_date, notes=None):
+    conn = connect_db()
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO payment_monitor_logs "
+            "(invoice_id, room_code, tenant_name, amount, due_date, status, notes) "
+            "VALUES (%s,%s,%s,%s,%s,'PENDING',%s)",
+            (f"{room_code}-{str(due_date).replace('-','')[:6]}", room_code, tenant_name,
+             float(amount), due_date, notes),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+# ------------------------------------------------------- đối soát chính
 def run_payment_check():
-    """Đối soát 1 lần: tìm hóa đơn quá hạn, cập nhật OVERDUE, cảnh báo, ghi log."""
     global _last_report
     ran_at = datetime.now(timezone.utc).isoformat()
-
     if not get_database_url():
-        _last_report = {
-            "status": "config_error",
-            "ran_at": ran_at,
-            "detail": "Thiếu DATABASE_URL — không thể kết nối Supabase.",
-        }
-        logger.error(_last_report["detail"])
+        _last_report = {"status": "config_error", "ran_at": ran_at, "detail": "Thiếu DATABASE_URL."}
         return _last_report
-
     try:
         import psycopg2.extras
     except ImportError:
-        _last_report = {
-            "status": "dependency_error",
-            "ran_at": ran_at,
-            "detail": "Chưa cài psycopg2-binary.",
-        }
-        logger.error(_last_report["detail"])
+        _last_report = {"status": "dependency_error", "ran_at": ran_at, "detail": "Chưa cài psycopg2-binary."}
         return _last_report
 
     conn = None
     try:
-        conn, _ = connect_db()
+        conn = connect_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-        # 1) Tìm hóa đơn PENDING đã quá hạn (due_date < hôm nay)
         cur.execute(
-            "SELECT id, invoice_id, tenant_name, room_code, amount, due_date "
-            "FROM payment_monitor_logs "
-            "WHERE status = 'PENDING' AND due_date IS NOT NULL "
-            "AND due_date < CURRENT_DATE "
+            "SELECT id, tenant_name, room_code, amount, due_date FROM payment_monitor_logs "
+            "WHERE status='PENDING' AND due_date IS NOT NULL AND due_date < CURRENT_DATE "
             "ORDER BY due_date ASC"
         )
         overdue = cur.fetchall()
-
-        # 2) Đánh dấu các hóa đơn đó thành OVERDUE
         if overdue:
-            ids = [row["id"] for row in overdue]
-            cur.execute(
-                "UPDATE payment_monitor_logs SET status = 'OVERDUE' "
-                "WHERE id = ANY(%s)",
-                (ids,),
-            )
-
-        # 3) Tổng hợp trạng thái hiện tại
+            ids = [r["id"] for r in overdue]
+            cur.execute("UPDATE payment_monitor_logs SET status='OVERDUE' WHERE id = ANY(%s)", (ids,))
         cur.execute(
-            "SELECT status, COUNT(*) AS n, COALESCE(SUM(amount), 0) AS total "
+            "SELECT status, COUNT(*) AS n, COALESCE(SUM(amount),0) AS total "
             "FROM payment_monitor_logs GROUP BY status"
         )
         summary = {r["status"]: {"count": r["n"], "total": float(r["total"])} for r in cur.fetchall()}
-
-        total_overdue_amount = sum(float(r["amount"] or 0) for r in overdue)
-
-        # 4) Ghi log + health
-        _log_to_db(
-            cur,
-            "INFO",
-            f"Đối soát xong: {len(overdue)} hóa đơn chuyển OVERDUE.",
-            {"overdue_count": len(overdue), "summary": summary},
-        )
-        _update_health(cur, "HEALTHY", "Đối soát thành công", success=1, error=0)
+        total_overdue = sum(float(r["amount"] or 0) for r in overdue)
+        try:
+            cur.execute(
+                "INSERT INTO module_logs (module_id, log_level, message) VALUES (%s,%s,%s)",
+                (MODULE_ID, "INFO", f"Đối soát: {len(overdue)} chuyển OVERDUE."),
+            )
+        except Exception:  # noqa: BLE001
+            pass
         conn.commit()
 
-        # 5) Cảnh báo Telegram nếu có nợ mới quá hạn
         if overdue:
-            lines = [
-                "🔴 <b>CẢNH BÁO NỢ QUÁ HẠN — An Cư Hà Nội</b>",
-                f"Có <b>{len(overdue)}</b> hóa đơn vừa chuyển sang quá hạn:",
-                "",
-            ]
+            lines = ["🔴 <b>NỢ QUÁ HẠN — An Cư Hà Nội</b>",
+                     f"{len(overdue)} hóa đơn vừa quá hạn:", ""]
             for r in overdue[:20]:
-                amt = f"{float(r['amount'] or 0):,.0f}đ"
-                lines.append(
-                    f"• {r['room_code'] or '?'} — {r['tenant_name'] or '?'} — "
-                    f"{amt} (hạn {r['due_date']})"
-                )
-            lines.append("")
-            lines.append(f"<b>Tổng nợ quá hạn mới: {total_overdue_amount:,.0f}đ</b>")
+                lines.append(f"• {r['room_code'] or '?'} — {r['tenant_name'] or '?'} — "
+                             f"{float(r['amount'] or 0):,.0f}đ (hạn {r['due_date']})")
+            lines += ["", f"<b>Tổng: {total_overdue:,.0f}đ</b>"]
             send_telegram_alert("\n".join(lines))
 
-        _last_report = {
-            "status": "ok",
-            "ran_at": ran_at,
-            "detail": f"{len(overdue)} hóa đơn chuyển OVERDUE.",
-            "overdue_count": len(overdue),
-            "overdue_amount": total_overdue_amount,
-            "summary": summary,
-        }
-        logger.info("Đối soát hoàn tất: %s hóa đơn quá hạn.", len(overdue))
+        _last_report = {"status": "ok", "ran_at": ran_at,
+                        "detail": f"{len(overdue)} hóa đơn chuyển OVERDUE.",
+                        "overdue_count": len(overdue), "overdue_amount": total_overdue,
+                        "summary": summary}
+        logger.info("Đối soát xong: %s quá hạn.", len(overdue))
         return _last_report
-
     except Exception as e:  # noqa: BLE001
         if conn:
             try:
                 conn.rollback()
             except Exception:  # noqa: BLE001
                 pass
-        _last_report = {
-            "status": "db_error",
-            "ran_at": ran_at,
-            "detail": f"Lỗi kết nối/truy vấn Supabase: {e}",
-        }
+        _last_report = {"status": "db_error", "ran_at": ran_at, "detail": f"Lỗi Supabase: {e}"}
         logger.error(_last_report["detail"])
         return _last_report
     finally:
@@ -288,50 +265,219 @@ def run_payment_check():
             conn.close()
 
 
-class _StatusHandler(BaseHTTPRequestHandler):
-    def do_GET(self):  # noqa: N802
-        body = json.dumps(
-            {"module": MODULE_ID, "service": "payment-monitor", **_last_report},
-            ensure_ascii=False,
-            indent=2,
-        ).encode("utf-8")
-        self.send_response(200)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+# ------------------------------------------------------------ HTTP server
+DASHBOARD_HTML = r"""<!doctype html><html lang="vi"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Quản trị Thanh toán — An Cư Hà Nội</title>
+<style>
+:root{--bg:#0f172a;--card:#1e293b;--line:#334155;--txt:#e2e8f0;--muted:#94a3b8}
+*{box-sizing:border-box}body{margin:0;font-family:system-ui,Segoe UI,Roboto,sans-serif;background:var(--bg);color:var(--txt)}
+.wrap{max-width:1000px;margin:0 auto;padding:16px}
+h1{font-size:20px;margin:8px 0}
+.sub{color:var(--muted);font-size:13px;margin-bottom:16px}
+.cards{display:flex;gap:12px;flex-wrap:wrap;margin-bottom:16px}
+.c{flex:1;min-width:150px;background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px}
+.c .n{font-size:22px;font-weight:700}.c .l{color:var(--muted);font-size:12px}
+.red .n{color:#f87171}.yel .n{color:#fbbf24}.grn .n{color:#34d399}
+.bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
+button{cursor:pointer;border:0;border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600}
+.b1{background:#2563eb;color:#fff}.b2{background:#334155;color:#e2e8f0}.paid{background:#059669;color:#fff}
+table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
+th,td{padding:10px 12px;text-align:left;font-size:13px;border-bottom:1px solid var(--line)}
+th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase}
+.badge{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700}
+.OVERDUE{background:#7f1d1d;color:#fecaca}.PENDING{background:#78350f;color:#fde68a}.PAID{background:#064e3b;color:#a7f3d0}
+.money{font-variant-numeric:tabular-nums;font-weight:600}
+.tblwrap{overflow-x:auto}
+dialog{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:18px;width:min(92vw,380px)}
+dialog input{width:100%;padding:8px;margin:6px 0 12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--txt)}
+label{font-size:12px;color:var(--muted)}
+.err{color:#f87171;font-size:13px;margin-top:8px}
+</style></head><body><div class="wrap">
+<h1>💰 Quản trị Thanh toán — Module 01</h1>
+<div class="sub">An Cư Hà Nội · dữ liệu trực tiếp từ Supabase · cập nhật lúc <span id="t">—</span></div>
+<div class="cards">
+  <div class="c red"><div class="n" id="s-over">—</div><div class="l">Quá hạn (OVERDUE)</div></div>
+  <div class="c yel"><div class="n" id="s-pend">—</div><div class="l">Chờ thu (PENDING)</div></div>
+  <div class="c grn"><div class="n" id="s-paid">—</div><div class="l">Đã thu (PAID)</div></div>
+</div>
+<div class="bar">
+  <button class="b1" onclick="add()">＋ Thêm hóa đơn</button>
+  <button class="b2" onclick="runCheck()">🔄 Chạy đối soát ngay</button>
+  <button class="b2" onclick="load()">↻ Tải lại</button>
+</div>
+<div class="tblwrap"><table><thead><tr>
+<th>Phòng</th><th>Khách</th><th>Số tiền</th><th>Hạn</th><th>Còn/Quá</th><th>Trạng thái</th><th></th>
+</tr></thead><tbody id="rows"><tr><td colspan="7">Đang tải…</td></tr></tbody></table></div>
+<div class="err" id="err"></div>
+</div>
 
-    def log_message(self, *args):  # tắt log HTTP ồn ào
+<dialog id="dlg"><h3 style="margin-top:0">Thêm hóa đơn</h3>
+<label>Mã phòng</label><input id="f-room" placeholder="KD-P6A">
+<label>Tên khách</label><input id="f-ten" placeholder="Nguyễn Văn A">
+<label>Số tiền (đ)</label><input id="f-amt" type="number" placeholder="5000000">
+<label>Ngày đến hạn</label><input id="f-due" type="date">
+<label>Ghi chú</label><input id="f-note" placeholder="(tùy chọn)">
+<div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
+<button class="b2" onclick="dlg.close()">Hủy</button><button class="b1" onclick="submitAdd()">Lưu</button></div>
+</dialog>
+
+<script>
+const $=id=>document.getElementById(id);
+const vnd=n=>n==null?'—':n.toLocaleString('vi-VN')+'đ';
+async function api(path,method,body){
+  const r=await fetch(path,{method:method||'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
+  if(!r.ok)throw new Error('HTTP '+r.status);return r.json();
+}
+async function load(){
+  try{
+    const d=await api('/api/payments');
+    let over=0,pend=0,paid=0,ov=0,pe=0;
+    const tb=$('rows');tb.innerHTML='';
+    d.forEach(p=>{
+      if(p.status==='OVERDUE'){over++;ov+=p.amount||0;}
+      else if(p.status==='PENDING'){pend++;pe+=p.amount||0;}
+      else if(p.status==='PAID')paid++;
+      const dd=p.days==null?'—':(p.days<0?('quá '+(-p.days)+'n'):('còn '+p.days+'n'));
+      const btn=p.status==='PAID'?'':`<button class="paid" onclick="markPaid(${p.id})">Đã thu</button>`;
+      tb.insertAdjacentHTML('beforeend',
+       `<tr><td>${p.room_code||''}</td><td>${p.tenant_name||''}</td>
+        <td class="money">${vnd(p.amount)}</td><td>${p.due_date||''}</td><td>${dd}</td>
+        <td><span class="badge ${p.status}">${p.status}</span></td><td>${btn}</td></tr>`);
+    });
+    $('s-over').textContent=over+' · '+vnd(ov);
+    $('s-pend').textContent=pend+' · '+vnd(pe);
+    $('s-paid').textContent=paid;
+    $('t').textContent=new Date().toLocaleString('vi-VN');
+    $('err').textContent='';
+  }catch(e){$('err').textContent='Lỗi tải dữ liệu: '+e.message;}
+}
+async function markPaid(id){
+  if(!confirm('Đánh dấu hóa đơn này ĐÃ THU?'))return;
+  try{await api('/api/mark-paid','POST',{id});load();}catch(e){alert('Lỗi: '+e.message);}
+}
+function add(){$('dlg').showModal();}
+async function submitAdd(){
+  const body={room_code:$('f-room').value.trim(),tenant_name:$('f-ten').value.trim(),
+    amount:$('f-amt').value,due_date:$('f-due').value,notes:$('f-note').value.trim()};
+  if(!body.room_code||!body.amount||!body.due_date){alert('Nhập đủ phòng, số tiền, hạn.');return;}
+  try{await api('/api/add','POST',body);$('dlg').close();load();}catch(e){alert('Lỗi: '+e.message);}
+}
+async function runCheck(){
+  try{const r=await api('/api/run','POST',{});alert('Đối soát xong: '+(r.detail||''));load();}
+  catch(e){alert('Lỗi: '+e.message);}
+}
+load();setInterval(load,60000);
+</script></body></html>"""
+
+
+class _Handler(BaseHTTPRequestHandler):
+    server_version = "PaymentMonitor/1.0"
+
+    def _send(self, code, body, ctype="application/json; charset=utf-8"):
+        data = body if isinstance(body, bytes) else body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        self.wfile.write(data)
+
+    def _authed(self):
+        pw = admin_password()
+        if not pw:
+            return True  # chưa có mật khẩu DB thì không chặn (staging)
+        hdr = self.headers.get("Authorization", "")
+        if hdr.startswith("Basic "):
+            try:
+                raw = base64.b64decode(hdr[6:]).decode("utf-8")
+                _, _, given = raw.partition(":")
+                return given == pw
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+
+    def _need_auth(self):
+        self.send_response(401)
+        self.send_header("WWW-Authenticate", 'Basic realm="Quan tri Thanh toan"')
+        self.send_header("Content-Type", "text/plain; charset=utf-8")
+        self.end_headers()
+        self.wfile.write("Can dang nhap.".encode("utf-8"))
+
+    def _body_json(self):
+        try:
+            n = int(self.headers.get("Content-Length", "0") or "0")
+            if n <= 0:
+                return {}
+            return json.loads(self.rfile.read(n).decode("utf-8") or "{}")
+        except Exception:  # noqa: BLE001
+            return {}
+
+    def do_GET(self):  # noqa: N802
+        path = urlparse(self.path).path
+        if path == "/status":
+            self._send(200, json.dumps({"module": MODULE_ID, **_last_report}, ensure_ascii=False, indent=2))
+            return
+        if not self._authed():
+            self._need_auth(); return
+        if path == "/" or path == "/index.html":
+            self._send(200, DASHBOARD_HTML, "text/html; charset=utf-8"); return
+        if path == "/api/payments":
+            try:
+                self._send(200, json.dumps(db_list_payments(), ensure_ascii=False))
+            except Exception as e:  # noqa: BLE001
+                self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
+            return
+        self._send(404, json.dumps({"error": "not found"}))
+
+    def do_POST(self):  # noqa: N802
+        path = urlparse(self.path).path
+        if not self._authed():
+            self._need_auth(); return
+        body = self._body_json()
+        try:
+            if path == "/api/mark-paid":
+                n = db_mark_paid(body.get("id"))
+                self._send(200, json.dumps({"ok": True, "updated": n}))
+            elif path == "/api/add":
+                db_add_payment(body.get("room_code"), body.get("tenant_name"),
+                               body.get("amount"), body.get("due_date"),
+                               body.get("notes") or None)
+                self._send(200, json.dumps({"ok": True}))
+            elif path == "/api/run":
+                rep = run_payment_check()
+                self._send(200, json.dumps(rep, ensure_ascii=False))
+            else:
+                self._send(404, json.dumps({"error": "not found"}))
+        except Exception as e:  # noqa: BLE001
+            self._send(500, json.dumps({"error": str(e)}, ensure_ascii=False))
+
+    def log_message(self, *args):  # tắt log ồn
         return
 
 
 def _scheduler_loop(interval_hours):
     import time
-
     while True:
         time.sleep(max(1, interval_hours) * 3600)
-        logger.info("Đến chu kỳ — chạy lại đối soát.")
-        run_payment_check()
+        with _run_lock:
+            run_payment_check()
 
 
 def main():
     logger.info("Khởi động %s", MODULE_ID)
-
-    # Chạy đối soát ngay lúc khởi động (công việc thật)
-    run_payment_check()
+    with _run_lock:
+        run_payment_check()
 
     port = os.getenv("PORT", "").strip()
     if not port:
-        # Cron Job / chạy tay: xong là thoát
         logger.info("Không có PORT — chế độ chạy một lần. Kết thúc.")
         return
 
-    # Web Service: tự lặp nền + mở cổng HTTP để Render thấy service Live
     interval = int(os.getenv("CHECK_INTERVAL_HOURS", "6") or "6")
     threading.Thread(target=_scheduler_loop, args=(interval,), daemon=True).start()
 
-    server = HTTPServer(("0.0.0.0", int(port)), _StatusHandler)
-    logger.info("Lắng nghe HTTP trên cổng %s (chu kỳ đối soát %sh).", port, interval)
+    server = ThreadingHTTPServer(("0.0.0.0", int(port)), _Handler)
+    logger.info("Trang quản trị chạy trên cổng %s (đối soát mỗi %sh).", port, interval)
     server.serve_forever()
 
 
