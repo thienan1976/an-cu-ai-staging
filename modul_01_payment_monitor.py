@@ -65,6 +65,67 @@ def get_database_url():
     return f"postgresql://{user}:{pwd}@{host}:{port}/{name}"
 
 
+# Region của project trên Supabase (không phải bí mật — chỉ là vị trí máy chủ).
+# Dùng để tự chuyển host trực tiếp (chỉ IPv6, Render free không tới được)
+# sang Connection Pooler (IPv4) khi cần.
+SUPABASE_POOLER_REGION = os.getenv("SUPABASE_POOLER_REGION", "ap-northeast-2").strip()
+
+
+def get_connection_candidates():
+    """
+    Trả về danh sách URL kết nối để thử theo thứ tự.
+    Nếu host là dạng Supabase trực tiếp (db.<ref>.supabase.co, chỉ IPv6),
+    ưu tiên các URL pooler (IPv4) để chạy được trên Render, rồi mới tới URL gốc.
+    """
+    import re
+    from urllib.parse import urlparse
+
+    base = get_database_url()
+    if not base:
+        return []
+
+    candidates = []
+    try:
+        p = urlparse(base)
+        host = p.hostname or ""
+        m = re.match(r"^db\.([a-z0-9]+)\.supabase\.co$", host)
+        if m:
+            ref = m.group(1)
+            pwd = p.password or ""
+            dbname = (p.path or "/postgres").lstrip("/") or "postgres"
+            region = SUPABASE_POOLER_REGION
+            for node in ("aws-1", "aws-0"):
+                for port in (6543, 5432):
+                    ph = f"{node}-{region}.pooler.supabase.com"
+                    candidates.append(
+                        f"postgresql://postgres.{ref}:{pwd}@{ph}:{port}/{dbname}"
+                    )
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Không phân tích được DATABASE_URL: %s", e)
+
+    candidates.append(base)  # host gốc để dự phòng (nơi có IPv6)
+    return candidates
+
+
+def connect_db():
+    """Thử lần lượt các URL ứng viên, trả về (conn, url) đầu tiên kết nối được."""
+    import psycopg2
+
+    last_err = None
+    for url in get_connection_candidates():
+        try:
+            conn = psycopg2.connect(url, connect_timeout=15)
+            safe = url.split("@")[-1]  # ẩn user/mật khẩu khi log
+            logger.info("Kết nối DB thành công qua %s", safe)
+            return conn, url
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            logger.warning("Không kết nối được (%s): %s", url.split("@")[-1], str(e).splitlines()[0])
+    if last_err:
+        raise last_err
+    raise RuntimeError("Không có URL kết nối nào khả dụng.")
+
+
 def send_telegram_alert(text):
     """Gửi cảnh báo qua Telegram nếu đã cấu hình. Không có thì bỏ qua êm."""
     token = os.getenv("TELEGRAM_BOT_TOKEN", "")
@@ -118,8 +179,7 @@ def run_payment_check():
     global _last_report
     ran_at = datetime.now(timezone.utc).isoformat()
 
-    db_url = get_database_url()
-    if not db_url:
+    if not get_database_url():
         _last_report = {
             "status": "config_error",
             "ran_at": ran_at,
@@ -129,7 +189,6 @@ def run_payment_check():
         return _last_report
 
     try:
-        import psycopg2
         import psycopg2.extras
     except ImportError:
         _last_report = {
@@ -142,7 +201,7 @@ def run_payment_check():
 
     conn = None
     try:
-        conn = psycopg2.connect(db_url, connect_timeout=15)
+        conn, _ = connect_db()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
         # 1) Tìm hóa đơn PENDING đã quá hạn (due_date < hôm nay)
