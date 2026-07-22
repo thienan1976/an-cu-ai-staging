@@ -178,17 +178,49 @@ def db_mark_paid(inv_id):
         conn.close()
 
 
-def db_add_payment(room_code, tenant_name, amount, due_date, notes=None):
+def db_add_payment(room_code, tenant_name, amount, due_date, notes=None, status="PENDING"):
     conn = connect_db()
     try:
         cur = conn.cursor()
         cur.execute(
             "INSERT INTO payment_monitor_logs "
             "(invoice_id, room_code, tenant_name, amount, due_date, status, notes) "
-            "VALUES (%s,%s,%s,%s,%s,'PENDING',%s)",
+            "VALUES (%s,%s,%s,%s,%s,%s,%s)",
             (f"{room_code}-{str(due_date).replace('-','')[:6]}", room_code, tenant_name,
-             float(amount), due_date, notes),
+             float(amount), due_date, (status or "PENDING").upper(), notes),
         )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def db_update_payment(inv_id, room_code, tenant_name, amount, due_date, status, notes=None):
+    conn = connect_db()
+    try:
+        cur = conn.cursor()
+        pay_date = None
+        if (status or "").upper() == "PAID":
+            cur.execute("SELECT payment_date FROM payment_monitor_logs WHERE id=%s", (int(inv_id),))
+            row = cur.fetchone()
+            pay_date = (row[0] if row and row[0] else date.today())
+        cur.execute(
+            "UPDATE payment_monitor_logs SET room_code=%s, tenant_name=%s, amount=%s, "
+            "due_date=%s, status=%s, notes=%s, payment_date=%s WHERE id=%s",
+            (room_code, tenant_name, float(amount), due_date, (status or "PENDING").upper(),
+             notes, pay_date, int(inv_id)),
+        )
+        conn.commit()
+        return cur.rowcount
+    finally:
+        conn.close()
+
+
+def db_delete_payment(inv_id):
+    conn = connect_db()
+    try:
+        cur = conn.cursor()
+        cur.execute("DELETE FROM payment_monitor_logs WHERE id=%s", (int(inv_id),))
         conn.commit()
         return cur.rowcount
     finally:
@@ -281,7 +313,7 @@ h1{font-size:20px;margin:8px 0}
 .red .n{color:#f87171}.yel .n{color:#fbbf24}.grn .n{color:#34d399}
 .bar{display:flex;gap:8px;flex-wrap:wrap;margin-bottom:12px}
 button{cursor:pointer;border:0;border-radius:8px;padding:8px 12px;font-size:13px;font-weight:600}
-.b1{background:#2563eb;color:#fff}.b2{background:#334155;color:#e2e8f0}.paid{background:#059669;color:#fff}
+.b1{background:#2563eb;color:#fff}.b2{background:#334155;color:#e2e8f0}.paid{background:#059669;color:#fff}.del{background:#7f1d1d;color:#fecaca}
 table{width:100%;border-collapse:collapse;background:var(--card);border-radius:12px;overflow:hidden}
 th,td{padding:10px 12px;text-align:left;font-size:13px;border-bottom:1px solid var(--line)}
 th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase}
@@ -312,26 +344,29 @@ label{font-size:12px;color:var(--muted)}
 <div class="err" id="err"></div>
 </div>
 
-<dialog id="dlg"><h3 style="margin-top:0">Thêm hóa đơn</h3>
+<dialog id="dlg"><h3 style="margin-top:0" id="dlg-title">Thêm hóa đơn</h3>
 <label>Mã phòng</label><input id="f-room" placeholder="KD-P6A">
 <label>Tên khách</label><input id="f-ten" placeholder="Nguyễn Văn A">
 <label>Số tiền (đ)</label><input id="f-amt" type="number" placeholder="5000000">
 <label>Ngày đến hạn</label><input id="f-due" type="date">
+<label>Trạng thái</label><select id="f-stt" style="width:100%;padding:8px;margin:6px 0 12px;background:var(--bg);border:1px solid var(--line);border-radius:8px;color:var(--txt)">
+<option value="PENDING">PENDING — chờ thu</option><option value="OVERDUE">OVERDUE — quá hạn</option><option value="PAID">PAID — đã thu</option></select>
 <label>Ghi chú</label><input id="f-note" placeholder="(tùy chọn)">
 <div style="display:flex;gap:8px;justify-content:flex-end;margin-top:8px">
-<button class="b2" onclick="dlg.close()">Hủy</button><button class="b1" onclick="submitAdd()">Lưu</button></div>
+<button class="b2" onclick="dlg.close()">Hủy</button><button class="b1" onclick="submitForm()">Lưu</button></div>
 </dialog>
 
 <script>
 const $=id=>document.getElementById(id);
 const vnd=n=>n==null?'—':n.toLocaleString('vi-VN')+'đ';
+let PAYMENTS=[], EDIT_ID=null;
 async function api(path,method,body){
   const r=await fetch(path,{method:method||'GET',headers:body?{'Content-Type':'application/json'}:{},body:body?JSON.stringify(body):undefined});
   if(!r.ok)throw new Error('HTTP '+r.status);return r.json();
 }
 async function load(){
   try{
-    const d=await api('/api/payments');
+    const d=await api('/api/payments');PAYMENTS=d;
     let over=0,pend=0,paid=0,ov=0,pe=0;
     const tb=$('rows');tb.innerHTML='';
     d.forEach(p=>{
@@ -339,11 +374,12 @@ async function load(){
       else if(p.status==='PENDING'){pend++;pe+=p.amount||0;}
       else if(p.status==='PAID')paid++;
       const dd=p.days==null?'—':(p.days<0?('quá '+(-p.days)+'n'):('còn '+p.days+'n'));
-      const btn=p.status==='PAID'?'':`<button class="paid" onclick="markPaid(${p.id})">Đã thu</button>`;
+      const paidBtn=p.status==='PAID'?'':`<button class="paid" onclick="markPaid(${p.id})">Đã thu</button> `;
+      const acts=`${paidBtn}<button class="b2" onclick="edit(${p.id})">Sửa</button> <button class="del" onclick="del(${p.id})">Xóa</button>`;
       tb.insertAdjacentHTML('beforeend',
        `<tr><td>${p.room_code||''}</td><td>${p.tenant_name||''}</td>
         <td class="money">${vnd(p.amount)}</td><td>${p.due_date||''}</td><td>${dd}</td>
-        <td><span class="badge ${p.status}">${p.status}</span></td><td>${btn}</td></tr>`);
+        <td><span class="badge ${p.status}">${p.status}</span></td><td style="white-space:nowrap">${acts}</td></tr>`);
     });
     $('s-over').textContent=over+' · '+vnd(ov);
     $('s-pend').textContent=pend+' · '+vnd(pe);
@@ -356,12 +392,30 @@ async function markPaid(id){
   if(!confirm('Đánh dấu hóa đơn này ĐÃ THU?'))return;
   try{await api('/api/mark-paid','POST',{id});load();}catch(e){alert('Lỗi: '+e.message);}
 }
-function add(){$('dlg').showModal();}
-async function submitAdd(){
+function fillForm(p){
+  $('f-room').value=p?p.room_code||'':'';$('f-ten').value=p?p.tenant_name||'':'';
+  $('f-amt').value=p?p.amount||'':'';$('f-due').value=p?p.due_date||'':'';
+  $('f-stt').value=p?p.status||'PENDING':'PENDING';$('f-note').value=p?p.notes||'':'';
+}
+function add(){EDIT_ID=null;$('dlg-title').textContent='Thêm hóa đơn';fillForm(null);$('dlg').showModal();}
+function edit(id){
+  const p=PAYMENTS.find(x=>x.id===id);if(!p)return;
+  EDIT_ID=id;$('dlg-title').textContent='Sửa hóa đơn — '+(p.room_code||'');fillForm(p);$('dlg').showModal();
+}
+async function del(id){
+  const p=PAYMENTS.find(x=>x.id===id);
+  if(!confirm('XÓA hóa đơn '+(p?p.room_code+' — '+p.tenant_name:id)+' ?\\nKhông khôi phục được.'))return;
+  try{await api('/api/delete','POST',{id});load();}catch(e){alert('Lỗi: '+e.message);}
+}
+async function submitForm(){
   const body={room_code:$('f-room').value.trim(),tenant_name:$('f-ten').value.trim(),
-    amount:$('f-amt').value,due_date:$('f-due').value,notes:$('f-note').value.trim()};
+    amount:$('f-amt').value,due_date:$('f-due').value,status:$('f-stt').value,notes:$('f-note').value.trim()};
   if(!body.room_code||!body.amount||!body.due_date){alert('Nhập đủ phòng, số tiền, hạn.');return;}
-  try{await api('/api/add','POST',body);$('dlg').close();load();}catch(e){alert('Lỗi: '+e.message);}
+  try{
+    if(EDIT_ID){body.id=EDIT_ID;await api('/api/update','POST',body);}
+    else{await api('/api/add','POST',body);}
+    $('dlg').close();load();
+  }catch(e){alert('Lỗi: '+e.message);}
 }
 async function runCheck(){
   try{const r=await api('/api/run','POST',{});alert('Đối soát xong: '+(r.detail||''));load();}
@@ -441,8 +495,17 @@ class _Handler(BaseHTTPRequestHandler):
             elif path == "/api/add":
                 db_add_payment(body.get("room_code"), body.get("tenant_name"),
                                body.get("amount"), body.get("due_date"),
-                               body.get("notes") or None)
+                               body.get("notes") or None, body.get("status") or "PENDING")
                 self._send(200, json.dumps({"ok": True}))
+            elif path == "/api/update":
+                n = db_update_payment(body.get("id"), body.get("room_code"),
+                                      body.get("tenant_name"), body.get("amount"),
+                                      body.get("due_date"), body.get("status"),
+                                      body.get("notes") or None)
+                self._send(200, json.dumps({"ok": True, "updated": n}))
+            elif path == "/api/delete":
+                n = db_delete_payment(body.get("id"))
+                self._send(200, json.dumps({"ok": True, "deleted": n}))
             elif path == "/api/run":
                 rep = run_payment_check()
                 self._send(200, json.dumps(rep, ensure_ascii=False))
