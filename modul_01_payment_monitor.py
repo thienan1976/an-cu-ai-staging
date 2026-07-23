@@ -84,6 +84,22 @@ RESOURCES = {
         ],
         "actions": [],
     },
+    "leads": {
+        "label": "📞 Khách/CRM",
+        "table": "leads",
+        "order": "CASE status WHEN 'new' THEN 0 WHEN 'contacted' THEN 1 WHEN 'viewing' THEN 2 WHEN 'deposit' THEN 3 WHEN 'won' THEN 4 ELSE 5 END, created_at DESC",
+        "badge": "status", "countdown": None,
+        "cols": [
+            {"k": "name", "l": "Khách", "t": "text"},
+            {"k": "phone", "l": "SĐT", "t": "text"},
+            {"k": "channel", "l": "Kênh", "t": "select", "opts": ["website", "facebook", "zalo", "chotot", "mogi", "tiktok", "khac"]},
+            {"k": "package", "l": "Phòng quan tâm", "t": "text"},
+            {"k": "status", "l": "Giai đoạn", "t": "select", "opts": ["new", "contacted", "viewing", "deposit", "won", "lost"]},
+            {"k": "handler", "l": "Phụ trách", "t": "text"},
+            {"k": "note", "l": "Ghi chú", "t": "text"},
+        ],
+        "actions": ["run"],
+    },
     "tenant": {
         "label": "🏅 Chấm điểm",
         "table": "tenant_scores",
@@ -234,12 +250,16 @@ def res_list(res_id):
         rows = [dict(r) for r in cur.fetchall()]
         today = date.today()
         for r in rows:
+            if r.get("id") is not None and not isinstance(r["id"], (int, str)):
+                r["id"] = str(r["id"])
             for c in cfg["cols"]:
                 v = r.get(c["k"])
                 if isinstance(v, (date, datetime)):
                     r[c["k"]] = v.isoformat()[:10]
                 elif isinstance(v, Decimal):
                     r[c["k"]] = float(v)
+                elif v is not None and not isinstance(v, (str, int, float, bool)):
+                    r[c["k"]] = str(v)
             # cột phụ: số ngày tới hạn (theo cột 'countdown' của resource)
             cd = cfg.get("countdown")
             if cd and r.get(cd):
@@ -263,7 +283,7 @@ def res_save(res_id, body):
         rec_id = body.get("id")
         if rec_id:  # UPDATE
             sets = ", ".join(f"{c['k']}=%s" for c in present)
-            vals = [_coerce(c, body.get(c["k"])) for c in present] + [int(rec_id)]
+            vals = [_coerce(c, body.get(c["k"])) for c in present] + [rec_id]
             cur.execute(f"UPDATE {cfg['table']} SET {sets} WHERE id=%s", vals)
         else:  # INSERT
             names = ", ".join(c["k"] for c in present)
@@ -281,7 +301,7 @@ def res_delete(res_id, rec_id):
     conn = connect_db()
     try:
         cur = conn.cursor()
-        cur.execute(f"DELETE FROM {cfg['table']} WHERE id=%s", (int(rec_id),))
+        cur.execute(f"DELETE FROM {cfg['table']} WHERE id=%s", (rec_id,))
         conn.commit()
         return cur.rowcount
     finally:
@@ -381,7 +401,37 @@ def run_maintenance():
         conn.close()
 
 
+def run_leads():
+    """Bám khách tự động: lead 'new' quá 24h chưa liên hệ → nhắc Haven qua Telegram.
+    Kèm thống kê phễu + kênh (đo lường)."""
+    import psycopg2.extras
+    conn = connect_db()
+    try:
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT name, phone, channel, package, created_at FROM leads "
+                    "WHERE status='new' AND created_at < NOW() - INTERVAL '24 hours' "
+                    "ORDER BY created_at ASC")
+        stale = cur.fetchall()
+        cur.execute("SELECT status, COUNT(*) AS n FROM leads GROUP BY status")
+        funnel = {r["status"]: r["n"] for r in cur.fetchall()}
+        cur.execute("SELECT channel, COUNT(*) AS n FROM leads GROUP BY channel ORDER BY n DESC")
+        chans = [(r["channel"] or "?", r["n"]) for r in cur.fetchall()]
+        if stale:
+            lines = ["🔔 <b>BÁM KHÁCH — Lead chưa liên hệ &gt;24h</b>", ""]
+            for r in stale[:20]:
+                lines.append(f"• {r['name'] or '?'} — {r['phone']} — {r['package'] or ''} ({r['channel'] or '?'})")
+            lines += ["", "Haven ơi — gọi/nhắn ngay kẻo mất khách! 💬"]
+            send_telegram("\n".join(lines))
+        fn = " · ".join(f"{k}:{v}" for k, v in funnel.items())
+        ch = " · ".join(f"{k}:{v}" for k, v in chans)
+        return f"Nhắc {len(stale)} lead nguội. Phễu: {fn or '—'}. Kênh: {ch or '—'}."
+    finally:
+        conn.close()
+
+
 def run_action(res_id):
+    if res_id == "leads":
+        return run_leads()
     if res_id == "payment":
         return run_payment()
     if res_id == "contract":
@@ -448,8 +498,9 @@ def run_all_scheduled():
         p = run_payment()
         c = run_contract()
         mn = run_maintenance()
+        ld = run_leads()
         _last_report = {"status": "ok", "ran_at": ran,
-                        "detail": f"Payment: {p} | Contract: {c} | Maintenance: {mn}"}
+                        "detail": f"Payment: {p} | Contract: {c} | Maintenance: {mn} | Leads: {ld}"}
     except Exception as e:  # noqa: BLE001
         _last_report = {"status": "db_error", "ran_at": ran, "detail": f"Lỗi: {e}"}
         logger.error(_last_report["detail"])
@@ -484,7 +535,8 @@ th{color:var(--muted);font-weight:600;font-size:11px;text-transform:uppercase}
 .badge{padding:2px 8px;border-radius:99px;font-size:11px;font-weight:700;background:#334155;color:#cbd5e1}
 .OVERDUE,.TERMINATION,.ABANDONED,.CANH_BAO,.HIGH,.CRITICAL{background:#7f1d1d;color:#fecaca}
 .PENDING,.WARNING,.ACTIVE,.THEO_DOI,.MEDIUM{background:#78350f;color:#fde68a}
-.PAID,.CONVERTED,.RENEWAL,.GIU,.LOW{background:#064e3b;color:#a7f3d0}
+.PAID,.CONVERTED,.RENEWAL,.GIU,.LOW,.deposit,.won{background:#064e3b;color:#a7f3d0}
+.new{background:#1e3a8a;color:#bfdbfe}.contacted,.viewing{background:#78350f;color:#fde68a}.lost{background:#7f1d1d;color:#fecaca}
 .money{font-variant-numeric:tabular-nums;font-weight:600}
 .tblwrap{overflow-x:auto}.muted{color:var(--muted)}
 dialog{background:var(--card);color:var(--txt);border:1px solid var(--line);border-radius:12px;padding:18px;width:min(94vw,420px)}
