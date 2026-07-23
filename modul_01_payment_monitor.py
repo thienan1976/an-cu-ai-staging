@@ -395,8 +395,8 @@ def run_action(res_id):
 
 # =============================================== OCR giấy tờ (FPT.AI Vision)
 def fpt_ocr_cccd(image_bytes):
-    """Gọi FPT.AI ID Recognition đọc CCCD/CMND. Trả dict thông tin trích xuất.
-    Cần env FPTAI_API_KEY. Đăng ký free tại https://fpt.ai."""
+    """Gọi FPT.AI ID Recognition đọc CCCD/CMND. Trả sẵn dict từng trường
+    (id, name, dob, sex, nationality, home, address, doe...). Cần env FPTAI_API_KEY."""
     key = os.getenv("FPTAI_API_KEY", "").strip()
     if _placeholder(key):
         raise RuntimeError("Chưa cấu hình FPTAI_API_KEY trong Render → Environment.")
@@ -412,12 +412,16 @@ def fpt_ocr_cccd(image_bytes):
         raise RuntimeError(j.get("errorMessage") or f"FPT.AI lỗi (mã {j.get('errorCode')})")
     rows = j.get("data") or []
     if not rows:
-        raise RuntimeError("Không đọc được thông tin từ ảnh.")
-    return rows[0]
+        raise RuntimeError("Không đọc được thông tin từ ảnh CCCD.")
+    d = rows[0]
+    # chuẩn hoá vài khoá cho đồng nhất với giao diện
+    d.setdefault("dob", d.get("dob") or d.get("date_of_birth"))
+    d.setdefault("address", d.get("address") or d.get("home"))
+    return d
 
 
 def ocr_create_asset(image_bytes):
-    """Đọc CCCD -> lưu 1 bản ghi asset_ocr_records, trả dữ liệu trích xuất."""
+    """Đọc CCCD bằng FPT.AI -> lưu 1 bản ghi asset_ocr_records, trả dữ liệu trích xuất."""
     import json as _json
     data = fpt_ocr_cccd(image_bytes)
     conn = connect_db()
