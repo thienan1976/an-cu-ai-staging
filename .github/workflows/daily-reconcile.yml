@@ -1,0 +1,29 @@
+name: Đối soát hằng ngày (An Cư)
+
+# Chạy tự động 01:00 UTC = 08:00 giờ Việt Nam mỗi ngày.
+# Độc lập với Render (không sợ service ngủ). Miễn phí trên repo GitHub.
+on:
+  schedule:
+    - cron: "0 1 * * *"
+  workflow_dispatch: {}   # cho phép bấm "Run workflow" chạy tay bất cứ lúc nào
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Cài thư viện
+        run: pip install -r requirements.txt
+
+      - name: Chạy đối soát (payment + contract + maintenance)
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_ALERT_CHANNEL: ${{ secrets.TELEGRAM_ALERT_CHANNEL }}
+        run: |
+          python -c "import modul_01_payment_monitor as m; print(m.run_all_scheduled())"

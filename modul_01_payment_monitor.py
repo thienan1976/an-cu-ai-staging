@@ -447,7 +447,9 @@ def run_all_scheduled():
     try:
         p = run_payment()
         c = run_contract()
-        _last_report = {"status": "ok", "ran_at": ran, "detail": f"Payment: {p} | Contract: {c}"}
+        mn = run_maintenance()
+        _last_report = {"status": "ok", "ran_at": ran,
+                        "detail": f"Payment: {p} | Contract: {c} | Maintenance: {mn}"}
     except Exception as e:  # noqa: BLE001
         _last_report = {"status": "db_error", "ran_at": ran, "detail": f"Lỗi: {e}"}
         logger.error(_last_report["detail"])
